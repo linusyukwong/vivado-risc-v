@@ -16,8 +16,10 @@ if { [llength [get_pins -quiet -hier -regexp "$eth_cell_name/clock"]] } {
   set eth_clock [get_clocks -of_objects [get_pins -hier -regexp "$eth_cell_name/clock"]]
   set eth_clock_period [get_property -min PERIOD $eth_clock]
 
-  set_max_delay -from $eth_clock -to $main_clock -datapath_only $main_clock_period
-  set_max_delay -from $main_clock -to $eth_clock -datapath_only $eth_clock_period
+  if { [lsort $eth_clock] ne [lsort $main_clock] } {
+    set_max_delay -from $eth_clock -to $main_clock -datapath_only $main_clock_period
+    set_max_delay -from $main_clock -to $eth_clock -datapath_only $eth_clock_period
+  }
 
   set_max_delay -from $main_clock -through [get_pins -hier -regexp "$eth_cell_name/async_resetn"] -datapath_only 10.0
   set_max_delay -from $eth_clock -through [get_pins -hier -regexp "$eth_cell_name/interrupt"] -datapath_only 10.0
@@ -107,6 +109,9 @@ if { [llength [get_pins -quiet -hier jtag/TCK]] } {
 } elseif { [llength [get_pins -quiet -hier SERIES7_BSCAN*/TCK]] } {
   # Debug Bridge is used for debugging
   set tck_pin [get_pins -hier SERIES7_BSCAN*/TCK]
+} elseif { [llength [get_pins -quiet -hier -filter {REF_PIN_NAME == USRTCKINT[0]}]] } {
+  # Native Versal CIPS BSCAN connects directly to the RISC-V Debug Module.
+  set tck_pin [get_pins -hier -filter {REF_PIN_NAME == USRTCKINT[0]}]
 }
 
 if { $tck_pin != "" } {

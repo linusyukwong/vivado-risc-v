@@ -30,6 +30,14 @@ vc707         Rocket.*          100.0
 (x3522pv)          Rocket.*b1[0-9].*     80.0
 (x3522pv)          Rocket.*              125.0
 
+(v80)          Rocket32s1            250.0
+(v80)          Rocket64b1            200.0
+(v80)          Rocket64.*gem.*       40.0
+(v80)          Rocket64[xyz].*       50.0
+(v80)          Rocket.*b[2-9][0-9].* 80.0
+(v80)          Rocket.*b1[0-9].*     100.0
+(v80)          Rocket.*              166.67
+
 .*            Rocket.*gem.*     20.0
 .*            Rocket64[xyz].*   20.0
 .*            Rocket.*l2w?      31.25

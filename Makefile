@@ -312,6 +312,17 @@ MAX_THREADS ?= 1
 .PHONY: vivado-tcl vivado-project vivado-gui bitstream
 
 FPGA_FNM    ?= riscv_wrapper.bit
+FPGA_WRITE_STEP ?= write_bitstream
+JTAG_BOOT_TCL ?= board/jtag-boot.tcl
+
+ifeq ($(FPGA_WRITE_STEP),write_device_image)
+# Recreate Versal projects when their design sources change.
+VIVADO_PROJECT_DEPS ?= vivado.tcl board/$(BOARD)/Makefile.inc \
+  $(wildcard board/$(BOARD)/*.tcl board/$(BOARD)/*.v ethernet/*.v)
+VIVADO_PROJECT_PREPARE ?= rm -rf $(proj_path)
+FPGA_CONSTRAINTS ?= board/timing-constraints.tcl \
+  $(wildcard board/$(BOARD)/*.xdc ethernet/*.tcl)
+endif
 
 proj_name   = $(BOARD)-riscv
 proj_path   = workspace/$(CONFIG)/vivado-$(proj_name)
@@ -361,7 +372,7 @@ $(bitstream): $(synthesis)
 	echo "set_param general.maxThreads $(MAX_THREADS)" >$(proj_path)/make-bitstream.tcl
 	echo "open_project $(proj_file)" >>$(proj_path)/make-bitstream.tcl
 	echo "reset_run impl_1" >>$(proj_path)/make-bitstream.tcl
-	echo "launch_runs -to_step write_bitstream impl_1" >>$(proj_path)/make-bitstream.tcl
+	echo "launch_runs -to_step $(FPGA_WRITE_STEP) impl_1" >>$(proj_path)/make-bitstream.tcl
 	echo "wait_on_run impl_1" >>$(proj_path)/make-bitstream.tcl
 	$(vivado) -source $(proj_path)/make-bitstream.tcl
 	if find $(proj_path) -name "*.log" -exec cat {} \; | grep 'ERROR: ' ; then exit 1 ; fi
@@ -377,7 +388,11 @@ $(cfgmem_file) $(prm_file): $(CFG_FILES)
 	echo "write_cfgmem -format $(CFG_FORMAT) -interface $(CFG_DEVICE) -loadbit {up 0x0 $(bitstream)} $(CFG_BOOT) -file $(cfgmem_file) -force" >>$(proj_path)/make-mcs.tcl
 	$(vivado) -source $(proj_path)/make-mcs.tcl
 
+ifeq ($(FPGA_WRITE_STEP),write_device_image)
+bitstream: $(bitstream)
+else
 bitstream: $(bitstream) $(cfgmem_file)
+endif
 
 # --- program flash memory ---
 
@@ -408,7 +423,7 @@ jtag-boot: $(bitstream) linux-stable/arch/riscv/boot/Image debian-riscv64/ramdis
 	 xsdb -quiet board/jtag-freq.tcl
 	env BITSTREAM=$(bitstream) \
 	env HW_SERVER_URL=tcp:$(HW_SERVER_ADDR) \
-	 xsdb -quiet board/jtag-boot.tcl
+	 xsdb -quiet $(JTAG_BOOT_TCL)
 
 # --- launch Vivado GUI ---
 
