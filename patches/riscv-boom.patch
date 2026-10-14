@@ -1,0 +1,543 @@
+diff --git a/src/main/scala/v3/exu/core.scala b/src/main/scala/v3/exu/core.scala
+index 751d1cc7..e1cdc4ff 100644
+--- a/src/main/scala/v3/exu/core.scala
++++ b/src/main/scala/v3/exu/core.scala
+@@ -117,9 +117,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
+                              numIntPhysRegs,
+                              numIrfReadPorts,
+                              numIrfWritePorts,
+                              xLen,
+-                             Seq.fill(memWidth) {true} ++ exe_units.bypassable_write_port_mask)) // bypassable ll_wb
++                             Seq.fill(memWidth) {true} ++ exe_units.bypassable_write_port_mask,
++                             pipelineWrites = true)) // bypassable ll_wb
+   val pregfile         = Module(new RegisterFileSynthesizable(
+                             ftqSz,
+                             exe_units.numIrfReaders,
+                             1,
+diff --git a/src/main/scala/v3/exu/fp-pipeline.scala b/src/main/scala/v3/exu/fp-pipeline.scala
+index 03cec087..24b4ef34 100644
+--- a/src/main/scala/v3/exu/fp-pipeline.scala
++++ b/src/main/scala/v3/exu/fp-pipeline.scala
+@@ -182,17 +182,26 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
+   // Cut up critical path by delaying the write by a cycle.
+   // Wakeup signal is sent on cycle S0, write is now delayed until end of S1,
+   // but Issue happens on S1 and RegRead doesn't happen until S2 so we're safe.
+   fregfile.io.write_ports(0) := RegNext(WritePort(ll_wbarb.io.out, fpregSz, fLen+1, RT_FLT))
++  // Keep recoding off the cache-response-to-register path. Delay the raw
++  // value, format and arbitration choice together, then recode for the RF
++  // write in S1. The S0 wakeup and S1 write cycles remain unchanged.
++  val ll_load_data = RegNext(io.ll_wports(0).bits.data)
++  val ll_load_double = RegNext(io.ll_wports(0).bits.uop.mem_size =/= 2.U)
++  val ll_load_selected = RegNext(io.ll_wports(0).valid)
++  val ll_from_int_data = RegNext(ifpu_resp.bits.data)
++  fregfile.io.write_ports(0).bits.data := Mux(ll_load_selected,
++    recode(ll_load_data, ll_load_double), ll_from_int_data)
+
+   assert (ll_wbarb.io.in(0).ready) // never backpressure the memory unit.
+   when (ifpu_resp.valid) { assert (ifpu_resp.bits.uop.rf_wen && ifpu_resp.bits.uop.dst_rtype === RT_FLT) }
+
+   var w_cnt = 1
+   for (i <- 1 until memWidth) {
+     fregfile.io.write_ports(w_cnt) := RegNext(WritePort(io.ll_wports(i), fpregSz, fLen+1, RT_FLT))
+-    fregfile.io.write_ports(w_cnt).bits.data := RegNext(recode(io.ll_wports(i).bits.data,
+-                                                               io.ll_wports(i).bits.uop.mem_size =/= 2.U))
++    fregfile.io.write_ports(w_cnt).bits.data := recode(RegNext(io.ll_wports(i).bits.data),
++      RegNext(io.ll_wports(i).bits.uop.mem_size =/= 2.U))
+     w_cnt += 1
+   }
+   for (eu <- exe_units) {
+     if (eu.writesFrf) {
+diff --git a/src/main/scala/v3/exu/register-read/regfile.scala b/src/main/scala/v3/exu/register-read/regfile.scala
+index 7165baa0..ee282ea3 100644
+--- a/src/main/scala/v3/exu/register-read/regfile.scala
++++ b/src/main/scala/v3/exu/register-read/regfile.scala
+@@ -107,15 +107,19 @@ class RegisterFileSynthesizable(
+    numRegisters: Int,
+    numReadPorts: Int,
+    numWritePorts: Int,
+    registerWidth: Int,
+-   bypassableArray: Seq[Boolean])
++   bypassableArray: Seq[Boolean],
++   pipelineWrites: Boolean = false)
+    (implicit p: Parameters)
+    extends RegisterFile(numRegisters, numReadPorts, numWritePorts, registerWidth, bypassableArray)
+ {
+   // --------------------------------------------------------------
+
+   val regfile = Mem(numRegisters, UInt(registerWidth.W))
++  // A pending write stage reduces the fanout of writeback data and control.
++  // Forward pending writes on every read so the interface latency is unchanged.
++  val memoryWrites = if (pipelineWrites) RegNext(io.write_ports) else io.write_ports
+
+   // --------------------------------------------------------------
+   // Read ports.
+
+@@ -124,9 +128,15 @@ class RegisterFileSynthesizable(
+   // Register the read port addresses to give a full cycle to the RegisterRead Stage (if desired).
+   val read_addrs = io.read_ports.map(p => RegNext(p.addr))
+
+   for (i <- 0 until numReadPorts) {
+-    read_data(i) := regfile(read_addrs(i))
++    if (pipelineWrites) {
++      read_data(i) := memoryWrites.foldLeft(regfile(read_addrs(i))) { (data, pending) =>
++        Mux(pending.valid && pending.bits.addr === read_addrs(i), pending.bits.data, data)
++      }
++    } else {
++      read_data(i) := regfile(read_addrs(i))
++    }
+   }
+
+   // --------------------------------------------------------------
+   // Bypass out of the ALU's write ports.
+@@ -157,9 +167,9 @@ class RegisterFileSynthesizable(
+
+   // --------------------------------------------------------------
+   // Write ports.
+
+-  for (wport <- io.write_ports) {
++  for (wport <- memoryWrites) {
+     when (wport.valid) {
+       regfile(wport.bits.addr) := wport.bits.data
+     }
+   }
+diff --git a/src/main/scala/v3/ifu/bpd/faubtb.scala b/src/main/scala/v3/ifu/bpd/faubtb.scala
+index 85f31484..f3786d1b 100644
+--- a/src/main/scala/v3/ifu/bpd/faubtb.scala
++++ b/src/main/scala/v3/ifu/bpd/faubtb.scala
+@@ -72,14 +72,30 @@ class FAMicroBTBBranchPredictorBank(params: BoomFAMicroBTBParams = BoomFAMicroBT
+       meta(w)(i).tag === s1_req_tag(tagSz-1,0)
+     })
+   })
+   val s1_hits     = s1_hit_ohs.map { oh => oh.reduce(_||_) }
+-  val s1_hit_ways = s1_hit_ohs.map { oh => PriorityEncoder(oh) }
++  // Select the first matching way directly rather than encoding an index and
++  // decoding it again through the data mux. A miss still reads the last way, as
++  // PriorityEncoder did, including the bits of an invalid prediction.
++  val s1_hit_selects = s1_hit_ohs.map { oh =>
++    VecInit((0 until nWays).map { way =>
++      if (nWays == 1) true.B
++      else if (way == 0) oh(0)
++      else if (way == nWays-1) !oh.take(way).reduce(_||_)
++      else oh(way) && !oh.take(way).reduce(_||_)
++    })
++  }
+
+   for (w <- 0 until bankWidth) {
+-    val entry_meta = meta(s1_hit_ways(w))(w)
++    val entry_meta = Mux1H(s1_hit_selects(w), meta.map(_(w)))
++    // Add each stored offset in parallel with the tag match, then select the
++    // completed target. This keeps the carry chain off the late way-select path.
++    // The priority selects include the original last-way result on a miss.
++    val targets = btb.map { way =>
++      (s1_pc.asSInt + (w << 1).S + way(w).offset).asUInt
++    }
+     s1_resp(w).valid := s1_valid && s1_hits(w)
+-    s1_resp(w).bits  := (s1_pc.asSInt + (w << 1).S + btb(s1_hit_ways(w))(w).offset).asUInt
++    s1_resp(w).bits  := Mux1H(s1_hit_selects(w), targets)
+     s1_is_br(w)      := s1_resp(w).valid &&  entry_meta.is_br
+     s1_is_jal(w)     := s1_resp(w).valid && !entry_meta.is_br
+     s1_taken(w)      := !entry_meta.is_br || entry_meta.ctr(1)
+
+diff --git a/src/main/scala/v3/ifu/bpd/loop.scala b/src/main/scala/v3/ifu/bpd/loop.scala
+index 702447c8..c236eac1 100644
+--- a/src/main/scala/v3/ifu/bpd/loop.scala
++++ b/src/main/scala/v3/ifu/bpd/loop.scala
+@@ -42,8 +42,10 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
+
+     val io = IO(new Bundle {
+       val f2_req_valid = Input(Bool())
+       val f2_req_idx  = Input(UInt())
++      val f2_update_idx_match = Input(Bool())
++      val f3_update_idx_match = Input(Bool())
+       val f3_req_fire = Input(Bool())
+
+       val f3_pred_in  = Input(Bool())
+       val f3_pred     = Output(Bool())
+@@ -63,15 +65,15 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
+
+
+     val entries = Reg(Vec(nSets, new LoopEntry))
+     val f2_entry = WireInit(entries(io.f2_req_idx))
+-    when (io.update_repair && io.update_idx === io.f2_req_idx) {
++    when (io.update_repair && io.f2_update_idx_match) {
+       f2_entry.s_cnt := io.update_meta.s_cnt
+-    } .elsewhen (io.update_mispredict && io.update_idx === io.f2_req_idx) {
++    } .elsewhen (io.update_mispredict && io.f2_update_idx_match) {
+       f2_entry.s_cnt := 0.U
+     }
+     val f3_entry = RegNext(f2_entry)
+-    val f3_scnt  = Mux(io.update_repair && io.update_idx === RegNext(io.f2_req_idx),
++    val f3_scnt  = Mux(io.update_repair && io.f3_update_idx_match,
+       io.update_meta.s_cnt,
+       f3_entry.s_cnt)
+     val f3_tag   = RegNext(io.f2_req_idx(tagSz+log2Ceil(nSets)-1,log2Ceil(nSets)))
+
+@@ -185,11 +187,20 @@ class LoopBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBan
+   override val metaSz = f3_meta.asUInt.getWidth
+
+   val update_meta = s1_update.bits.meta.asTypeOf(Vec(bankWidth, new LoopMeta))
+
++  // Compare before the existing index registers. At F2 these equal
++  // s1_update_idx === s2_idx, and at F3 s1_update_idx === s3_idx.
++  // This removes a wide comparison from the repair-to-prediction bypass
++  // without changing its cycle or the predictor's externally visible latency.
++  val f2_update_idx_match = RegNext(s0_update_idx === s1_idx)
++  val f3_update_idx_match = RegNext(s0_update_idx === s2_idx)
++
+   for (w <- 0 until bankWidth) {
+     columns(w).io.f2_req_valid := s2_valid
+     columns(w).io.f2_req_idx  := s2_idx
++    columns(w).io.f2_update_idx_match := f2_update_idx_match
++    columns(w).io.f3_update_idx_match := f3_update_idx_match
+     columns(w).io.f3_req_fire := (s3_valid && s3_mask(w) && io.f3_fire &&
+       RegNext(io.resp_in(0).f2(w).predicted_pc.valid && io.resp_in(0).f2(w).is_br))
+
+     columns(w).io.f3_pred_in  := io.resp_in(0).f3(w).taken
+diff --git a/src/main/scala/v3/ifu/bpd/tage.scala b/src/main/scala/v3/ifu/bpd/tage.scala
+index 39ef8583..a7c46b04 100644
+--- a/src/main/scala/v3/ifu/bpd/tage.scala
++++ b/src/main/scala/v3/ifu/bpd/tage.scala
+@@ -32,8 +32,9 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
+     val f1_req_valid = Input(Bool())
+     val f1_req_pc    = Input(UInt(vaddrBitsExtended.W))
+     val f1_req_ghist = Input(UInt(globalHistoryLength.W))
+
++    val f2_resp = Output(Vec(bankWidth, Valid(new TageResp)))
+     val f3_resp = Output(Vec(bankWidth, Valid(new TageResp)))
+
+     val update_mask    = Input(Vec(bankWidth, Bool()))
+     val update_taken   = Input(Vec(bankWidth, Bool()))
+@@ -100,8 +101,11 @@ class TageTable(val nRows: Int, val tagSz: Int, val histLength: Int, val uBitPer
+   val s2_req_rhits = VecInit(s2_req_rtage.map(e => e.valid && e.tag === s2_tag && !doing_reset))
+
+   for (w <- 0 until bankWidth) {
+     // This bit indicates the TAGE table matched here
++    io.f2_resp(w).valid    := s2_req_rhits(w)
++    io.f2_resp(w).bits.u   := Cat(s2_req_rhius(w), s2_req_rlous(w))
++    io.f2_resp(w).bits.ctr := s2_req_rtage(w).ctr
+     io.f3_resp(w).valid    := RegNext(s2_req_rhits(w))
+     io.f3_resp(w).bits.u   := RegNext(Cat(s2_req_rhius(w), s2_req_rlous(w)))
+     io.f3_resp(w).bits.ctr := RegNext(s2_req_rtage(w).ctr)
+   }
+@@ -230,8 +234,9 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
+   }
+   val tables = tt.map(_._1)
+   val mems = tt.map(_._2).flatten
+
++  val f2_resps = VecInit(tables.map(_.io.f2_resp))
+   val f3_resps = VecInit(tables.map(_.io.f3_resp))
+
+   val s1_update_meta = s1_update.bits.meta.asTypeOf(new TageMeta)
+   val s1_update_mispredict_mask = UIntToOH(s1_update.bits.cfi_idx.bits) &
+@@ -251,19 +256,35 @@ class TageBranchPredictorBank(params: BoomTageParams = BoomTageParams())(implici
+   s1_update_u       := DontCare
+
+
+   for (w <- 0 until bankWidth) {
++    // Select the TAGE prediction before the existing F2-to-F3 boundary.
++    // Track the bimodal fallback symbolically, since its F3 response remains
++    // an input to this bank. Only that final fallback mux stays in F3.
++    var f2_taken = false.B
++    var f2_use_bim = true.B
++    var f2_alt_taken = false.B
++    var f2_alt_use_bim = true.B
++    for (i <- 0 until tageNTables) {
++      val hit = f2_resps(i)(w).valid
++      val ctr = f2_resps(i)(w).bits.ctr
++      val weak = ctr === 3.U || ctr === 4.U
++      f2_taken = Mux(hit, Mux(weak, f2_alt_taken, ctr(2)), f2_taken)
++      f2_use_bim = Mux(hit, weak && f2_alt_use_bim, f2_use_bim)
++      f2_alt_taken = Mux(hit, ctr(2), f2_alt_taken)
++      f2_alt_use_bim = f2_alt_use_bim && !hit
++    }
++    io.resp.f3(w).taken := Mux(RegNext(f2_use_bim), io.resp_in(0).f3(w).taken,
++      RegNext(f2_taken))
++
+     var altpred = io.resp_in(0).f3(w).taken
+     val final_altpred = WireInit(io.resp_in(0).f3(w).taken)
+     var provided = false.B
+     var provider = 0.U
+-    io.resp.f3(w).taken := io.resp_in(0).f3(w).taken
+
+     for (i <- 0 until tageNTables) {
+       val hit = f3_resps(i)(w).valid
+-      val ctr = f3_resps(i)(w).bits.ctr
+       when (hit) {
+-        io.resp.f3(w).taken := Mux(ctr === 3.U || ctr === 4.U, altpred, ctr(2))
+         final_altpred       := altpred
+       }
+
+       provided = provided || hit
+diff --git a/src/main/scala/v3/ifu/frontend.scala b/src/main/scala/v3/ifu/frontend.scala
+index 267940aa..6a2919f2 100644
+--- a/src/main/scala/v3/ifu/frontend.scala
++++ b/src/main/scala/v3/ifu/frontend.scala
+@@ -80,9 +80,10 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
+   def =/=(other: GlobalHistory): Bool = !(this === other)
+
+   def update(branches: UInt, cfi_taken: Bool, cfi_is_br: Bool, cfi_idx: UInt,
+     cfi_valid: Bool, addr: UInt,
+-    cfi_is_call: Bool, cfi_is_ret: Bool): GlobalHistory = {
++    cfi_is_call: Bool, cfi_is_ret: Bool,
++    comparisons: Seq[(GlobalHistory, Bool)] = Nil): GlobalHistory = {
+     val cfi_idx_fixed = cfi_idx(log2Ceil(fetchWidth)-1,0)
+     val cfi_idx_oh = UIntToOH(cfi_idx_fixed)
+     val new_history = Wire(new GlobalHistory)
+
+@@ -97,8 +98,20 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
+       val saw_not_taken_branch = not_taken_branches =/= 0.U || current_saw_branch_not_taken
+       new_history.old_history := Mux(cfi_is_br && cfi_taken && cfi_valid   , histories(0) << 1 | 1.U,
+                                  Mux(saw_not_taken_branch                  , histories(0) << 1,
+                                                                              histories(0)))
++      // Compare the possible histories in parallel, before the late branch
++      // prediction selects one. This avoids a wide equality after that mux.
++      comparisons.foreach { case (other, matches) =>
++        val shifted = (histories(0) << 1)(globalHistoryLength-1, 0)
++        val history_matches = Mux(cfi_is_br && cfi_taken && cfi_valid,
++          other.old_history === (shifted | 1.U),
++          Mux(saw_not_taken_branch, other.old_history === shifted,
++            other.old_history === histories(0)))
++        matches := history_matches &&
++          other.new_saw_branch_not_taken === new_history.new_saw_branch_not_taken &&
++          other.new_saw_branch_taken === new_history.new_saw_branch_taken
++      }
+     } else {
+       // In the two bank case every bank ignore the history added by the previous bank
+       val base = histories(1)
+       val cfi_in_bank_0 = cfi_valid && cfi_taken && cfi_idx_fixed < bankWidth.U
+@@ -121,8 +134,11 @@ class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
+       }
+     }
+     new_history.ras_idx := Mux(cfi_valid && cfi_is_call, WrapInc(ras_idx, nRasEntries),
+                            Mux(cfi_valid && cfi_is_ret , WrapDec(ras_idx, nRasEntries), ras_idx))
++    if (nBanks != 1) {
++      comparisons.foreach { case (other, matches) => matches := other === new_history }
++    }
+     new_history
+   }
+
+ }
+@@ -465,19 +481,21 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
+   val f2_do_redirect = f2_redirects.reduce(_||_) && useBPD.B
+   val f2_predicted_target = Mux(f2_do_redirect,
+                                 f2_targs(f2_redirect_idx),
+                                 nextFetch(s2_vpc))
++  val f2_ghist_matches_s1 = Wire(Bool())
+   val f2_predicted_ghist = s2_ghist.update(
+     f2_bpd_resp.preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f2_mask,
+     f2_bpd_resp.preds(f2_redirect_idx).taken && f2_do_redirect,
+     f2_bpd_resp.preds(f2_redirect_idx).is_br,
+     f2_redirect_idx,
+     f2_do_redirect,
+     s2_vpc,
+     false.B,
+-    false.B)
++    false.B,
++    Seq((s1_ghist, f2_ghist_matches_s1)))
+
+-  val f2_correct_f1_ghist = s1_ghist =/= f2_predicted_ghist && enableGHistStallRepair.B
++  val f2_correct_f1_ghist = !f2_ghist_matches_s1 && enableGHistStallRepair.B
+
+   when ((s2_valid && !icache.io.resp.valid) ||
+         (s2_valid && icache.io.resp.valid && !f3_ready)) {
+     s0_valid := (!s2_tlb_resp.ae.inst && !s2_tlb_resp.pf.inst) || s2_is_replay || s2_tlb_miss
+@@ -535,8 +553,28 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
+   f3.io.enq.bits.xcpt := s2_tlb_resp
+   f3.io.enq.bits.fsrc := s2_fsrc
+   f3.io.enq.bits.tsrc := s2_tsrc
+
++  // The carried instruction starts two bytes before the first bank. Compute
++  // its PC when the one-entry F3 queue is written, avoiding a subtract followed
++  // by the branch-target add in F3. The aligned low bits are always bankBytes-2.
++  val f3_edge_pc_hi = RegEnable(
++    s2_vpc(vaddrBitsExtended-1, log2Ceil(bankBytes)) - 1.U, f3.io.enq.fire)
++  val f3_edge_pc = Cat(f3_edge_pc_hi, (bankBytes-2).U(log2Ceil(bankBytes).W))
++
++  // Expand ordinary instructions on the input side of the F3 queue. Carried
++  // instructions still combine with the saved halfword in F3. Use the queue's
++  // write enable, preserving stalls and replacing no architectural stage.
++  val f3_pre_exp_insts = (0 until fetchWidth).map { i =>
++    val input_inst = if (i % bankWidth == bankWidth - 1)
++      Cat(0.U(16.W), f3.io.enq.bits.data(i*16+15, i*16))
++    else f3.io.enq.bits.data(i*16+31, i*16)
++    // Expanded instructions always have the uncompressed low bits, including
++    // before the first queue write; retain those constants outside the register.
++    val input_expanded = ExpandRVC(input_inst)
++    Cat(RegEnable(input_expanded(31, 2), f3.io.enq.fire), 3.U(2.W))
++  }
++
+   // RAS takes a cycle to read
+   val ras_read_idx = RegInit(0.U(log2Ceil(nRasEntries).W))
+   ras.io.read_idx := ras_read_idx
+   when (f3.io.enq.fire) {
+@@ -613,11 +651,15 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
+       val brsigs = Wire(new BranchDecodeSignals)
+       if (w == 0) {
+         val inst0 = Cat(bank_data(15,0), f3_prev_half)
+         val inst1 = bank_data(31,0)
+-        val exp_inst0 = ExpandRVC(inst0)
+-        val exp_inst1 = ExpandRVC(inst1)
+-        val pc0 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U - 2.U)
++        // In the first bank this path is selected only for a saved half of a
++        // 32-bit instruction: f3_prev_is_half implies f3_prev_half(1,0) == 3.
++        // Avoid putting the RVC expansion mux on that carried-instruction path.
++        val exp_inst0 = if (b == 0) inst0 else ExpandRVC(inst0)
++        val exp_inst1 = f3_pre_exp_insts(i)
++        val pc0 = if (b == 0) f3_edge_pc else
++          (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U - 2.U)
+         val pc1 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U)
+
+         val bpd_decoder0 = Module(new BranchDecode)
+         bpd_decoder0.io.inst := exp_inst0
+@@ -657,9 +699,9 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
+         }
+         valid := true.B
+       } else {
+         val inst = Wire(UInt(32.W))
+-        val exp_inst = ExpandRVC(inst)
++        val exp_inst = f3_pre_exp_insts(i)
+         val pc = f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U
+         val bpd_decoder = Module(new BranchDecode)
+         bpd_decoder.io.inst := exp_inst
+         bpd_decoder.io.pc   := pc
+@@ -789,17 +831,20 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
+     nextFetch(f3_fetch_bundle.pc)
+   )
+
+   f3_fetch_bundle.next_pc       := f3_predicted_target
++  val f3_ghist_matches_s1 = Wire(Bool())
++  val f3_ghist_matches_s2 = Wire(Bool())
+   val f3_predicted_ghist = f3_fetch_bundle.ghist.update(
+     f3_fetch_bundle.br_mask,
+     f3_fetch_bundle.cfi_idx.valid,
+     f3_fetch_bundle.br_mask(f3_fetch_bundle.cfi_idx.bits),
+     f3_fetch_bundle.cfi_idx.bits,
+     f3_fetch_bundle.cfi_idx.valid,
+     f3_fetch_bundle.pc,
+     f3_fetch_bundle.cfi_is_call,
+-    f3_fetch_bundle.cfi_is_ret
++    f3_fetch_bundle.cfi_is_ret,
++    Seq((s1_ghist, f3_ghist_matches_s1), (s2_ghist, f3_ghist_matches_s2))
+   )
+
+
+   ras.io.write_valid := false.B
+@@ -807,10 +852,10 @@ class BoomFrontendModule(outer: BoomFrontend) extends LazyModuleImp(outer)
+     f3_fetch_bundle.cfi_npc_plus4, 4.U, 2.U)
+   ras.io.write_idx   := WrapInc(f3_fetch_bundle.ghist.ras_idx, nRasEntries)
+
+
+-  val f3_correct_f1_ghist = s1_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
+-  val f3_correct_f2_ghist = s2_ghist =/= f3_predicted_ghist && enableGHistStallRepair.B
++  val f3_correct_f1_ghist = !f3_ghist_matches_s1 && enableGHistStallRepair.B
++  val f3_correct_f2_ghist = !f3_ghist_matches_s2 && enableGHistStallRepair.B
+
+   when (f3.io.deq.valid && f4_ready) {
+     when (f3_fetch_bundle.cfi_is_call && f3_fetch_bundle.cfi_idx.valid) {
+       ras.io.write_valid := true.B
+diff --git a/src/main/scala/v3/lsu/dcache.scala b/src/main/scala/v3/lsu/dcache.scala
+index 2fc7bd7a..4a62efc4 100644
+--- a/src/main/scala/v3/lsu/dcache.scala
++++ b/src/main/scala/v3/lsu/dcache.scala
+@@ -759,8 +759,9 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
+     mshrs.io.req(w).bits             := DontCare
+     mshrs.io.req(w).bits.uop         := s2_req(w).uop
+     mshrs.io.req(w).bits.uop.br_mask := GetNewBrMask(io.lsu.brupdate, s2_req(w).uop)
+     mshrs.io.req(w).bits.addr        := s2_req(w).addr
++    mshrs.io.req_addr_s1(w)          := s1_req(w).addr
+     mshrs.io.req(w).bits.tag_match   := s2_tag_match(w)
+     mshrs.io.req(w).bits.old_meta    := Mux(s2_tag_match(w), L1Metadata(s2_repl_meta(w).tag, s2_hit_state(w)), s2_repl_meta(w))
+     mshrs.io.req(w).bits.way_en      := Mux(s2_tag_match(w), s2_tag_match_way(w), s2_replaced_way_en)
+
+diff --git a/src/main/scala/v3/lsu/mshrs.scala b/src/main/scala/v3/lsu/mshrs.scala
+index b3d170cb..774f8468 100644
+--- a/src/main/scala/v3/lsu/mshrs.scala
++++ b/src/main/scala/v3/lsu/mshrs.scala
+@@ -55,8 +55,9 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
+
+     val idx = Output(Valid(UInt()))
+     val way = Output(Valid(UInt()))
+     val tag = Output(Valid(UInt()))
++    val next_req_addr = Output(UInt(coreMaxAddrBits.W))
+
+
+     val mem_acquire = Decoupled(new TLBundleA(edge.bundle))
+
+@@ -106,8 +107,9 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
+   val s_invalid :: s_refill_req :: s_refill_resp :: s_drain_rpq_loads :: s_meta_read :: s_meta_resp_1 :: s_meta_resp_2 :: s_meta_clear :: s_wb_meta_read :: s_wb_req :: s_wb_resp :: s_commit_line :: s_drain_rpq :: s_meta_write_req :: s_mem_finish_1 :: s_mem_finish_2 :: s_prefetched :: s_prefetch :: Nil = Enum(18)
+   val state = RegInit(s_invalid)
+
+   val req     = Reg(new BoomDCacheReqInternal)
++  io.next_req_addr := req.addr
+   val req_idx = req.addr(untagBits-1, blockOffBits)
+   val req_tag = req.addr >> untagBits
+   val req_block_addr = (req.addr >> blockOffBits) << blockOffBits
+   val req_needs_wb = RegInit(false.B)
+@@ -192,8 +194,9 @@ class BoomMSHR(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p)
+     grantack.valid := false.B
+     refill_ctr := 0.U
+     assert(rpq.io.enq.ready)
+     req := io.req
++    io.next_req_addr := io.req.addr
+     val old_coh   = io.req.old_meta.coh
+     req_needs_wb := old_coh.onCacheControl(M_FLUSH)._1 // does the line we are evicting need to be written back
+     when (io.req.tag_match) {
+       val (is_hit, _, coh_on_hit) = old_coh.onAccess(io.req.uop.mem_cmd)
+@@ -514,8 +517,9 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
+   with HasL1HellaCacheParameters
+ {
+   val io = IO(new Bundle {
+     val req  = Flipped(Vec(memWidth, Decoupled(new BoomDCacheReqInternal))) // Req from s2 of DCache pipe
++    val req_addr_s1 = Input(Vec(memWidth, UInt(coreMaxAddrBits.W)))
+     val req_is_probe = Input(Vec(memWidth, Bool()))
+     val resp = Decoupled(new BoomDCacheResp)
+     val secondary_miss = Output(Vec(memWidth, Bool()))
+     val block_hit = Output(Vec(memWidth, Bool()))
+@@ -564,10 +568,15 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
+
+   // --------------------
+   // The MSHR SDQ
+   val sdq_val      = RegInit(0.U(cfg.nSDQ.W))
++  val sdq_val_next = Wire(UInt(cfg.nSDQ.W))
++  sdq_val_next := sdq_val
++  sdq_val := sdq_val_next
+   val sdq_alloc_id = PriorityEncoder(~sdq_val(cfg.nSDQ-1,0))
+-  val sdq_rdy      = !sdq_val.andR
++  // Compute availability alongside the bitmap update, before the same clock
++  // edge. This removes the bitmap reduction from cache request/backpressure.
++  val sdq_rdy      = RegNext(!sdq_val_next.andR, true.B)
+   val sdq_enq      = req.fire && cacheable && isWrite(req.bits.uop.mem_cmd)
+   val sdq          = Mem(cfg.nSDQ, UInt(coreDataBits.W))
+
+   when (sdq_enq) {
+@@ -632,10 +641,17 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
+     val mshr = Module(new BoomMSHR)
+     mshr.io.id := i.U(log2Ceil(cfg.nMSHRs).W)
+
+     for (w <- 0 until memWidth) {
+-      idx_matches(w)(i) := mshr.io.idx.valid && mshr.io.idx.bits === io.req(w).bits.addr(untagBits-1,blockOffBits)
+-      tag_matches(w)(i) := mshr.io.tag.valid && mshr.io.tag.bits === io.req(w).bits.addr >> untagBits
++      // Compare before the cache's S1-to-S2 request registers. Include any
++      // primary request accepted by the MSHR on this edge, so the registered
++      // comparison uses exactly the same address as the next MSHR state.
++      val idx_equal = RegNext(mshr.io.next_req_addr(untagBits-1,blockOffBits) ===
++        io.req_addr_s1(w)(untagBits-1,blockOffBits))
++      val tag_equal = RegNext((mshr.io.next_req_addr >> untagBits) ===
++        (io.req_addr_s1(w) >> untagBits))
++      idx_matches(w)(i) := mshr.io.idx.valid && idx_equal
++      tag_matches(w)(i) := mshr.io.tag.valid && tag_equal
+       way_matches(w)(i) := mshr.io.way.valid && mshr.io.way.bits === io.req(w).bits.way_en
+     }
+     wb_tag_list(i) := mshr.io.wb_req.bits.tag
+
+@@ -765,9 +781,9 @@ class BoomMSHRFile(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()
+   io.replay <> replay_arb.io.out
+   io.replay.bits.data := sdq(replay_arb.io.out.bits.sdq_id)
+
+   when (io.replay.valid || sdq_enq) {
+-    sdq_val := sdq_val & ~(UIntToOH(replay_arb.io.out.bits.sdq_id) & Fill(cfg.nSDQ, free_sdq)) |
++    sdq_val_next := sdq_val & ~(UIntToOH(replay_arb.io.out.bits.sdq_id) & Fill(cfg.nSDQ, free_sdq)) |
+       PriorityEncoderOH(~sdq_val(cfg.nSDQ-1,0)) & Fill(cfg.nSDQ, sdq_enq)
+   }
+
+   prefetcher.io.mshr_avail    := RegNext(pri_rdy)

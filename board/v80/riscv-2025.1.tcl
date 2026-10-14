@@ -47,6 +47,12 @@ set files [list \
 ]
 add_files -norecurse -fileset $source_fileset $files
 
+set floorplan [file join $script_folder floorplan.tcl]
+add_files -norecurse -fileset $constraint_fileset $floorplan
+set_property FILE_TYPE TCL [get_files $floorplan]
+set_property USED_IN_SYNTHESIS false [get_files $floorplan]
+set_property PROCESSING_ORDER LATE [get_files $floorplan]
+
 ##################################################################
 # DESIGN PROCs
 ##################################################################
@@ -330,6 +336,19 @@ proc create_root_design { parentCell } {
   set_property -dict [list CONFIG.DATA_WIDTH [get_property CONFIG.DATA_WIDTH $mem_intf] \
       CONFIG.ID_WIDTH [get_property CONFIG.ID_WIDTH $mem_intf]] $Memory_Address
 
+  # Register both directions of every AXI channel at the CPU/NoC boundary.
+  # Full mode preserves burst ordering and throughput while breaking the long
+  # CPU-to-NMU address and NMU-to-CPU response/ready paths at 200 MHz.
+  set pipeline_memory [expr {[get_property VLNV [get_bd_cells RocketChip]] eq "xilinx.com:module_ref:Rocket64w1:1.0"}]
+  if {$pipeline_memory} {
+    set Memory_Pipeline [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_register_slice:2.1 Memory_Pipeline]
+    set_property -dict [list CONFIG.PROTOCOL AXI4 CONFIG.ADDR_WIDTH 48 \
+        CONFIG.DATA_WIDTH [get_property CONFIG.DATA_WIDTH $mem_intf] \
+        CONFIG.ID_WIDTH [get_property CONFIG.ID_WIDTH $mem_intf] \
+        CONFIG.REG_AW 1 CONFIG.REG_W 1 CONFIG.REG_B 1 \
+        CONFIG.REG_AR 1 CONFIG.REG_R 1] $Memory_Pipeline
+  }
+
   # Create instance: DDR, and set properties
   set DDR [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_noc:1.1 DDR ]
   # V80 32 GiB ECC DDR4 RDIMM profile from AVED's axi_noc_mc_ddr4_1.
@@ -382,7 +401,12 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_ports sys_clk0_1] [get_bd_intf_pins DDR/sys_clk0]
   connect_bd_intf_net [get_bd_intf_ports CH0_DDR4_0_1] [get_bd_intf_pins DDR/CH0_DDR4_0]
   connect_bd_intf_net $mem_intf [get_bd_intf_pins Memory_Address/S_AXI]
-  connect_bd_intf_net [get_bd_intf_pins Memory_Address/M_AXI] [get_bd_intf_pins DDR/S00_AXI]
+  if {$pipeline_memory} {
+    connect_bd_intf_net [get_bd_intf_pins Memory_Address/M_AXI] [get_bd_intf_pins Memory_Pipeline/S_AXI]
+    connect_bd_intf_net [get_bd_intf_pins Memory_Pipeline/M_AXI] [get_bd_intf_pins DDR/S00_AXI]
+  } else {
+    connect_bd_intf_net [get_bd_intf_pins Memory_Address/M_AXI] [get_bd_intf_pins DDR/S00_AXI]
+  }
   connect_bd_intf_net [get_bd_intf_pins RocketChip/IO_AXI4] [get_bd_intf_pins IO/S01_AXI]
   connect_bd_intf_net [get_bd_intf_pins IO/M00_AXI] [get_bd_intf_pins CIPS/S_AXI_LPD]
   connect_bd_intf_net [get_bd_intf_pins IO/M01_AXI] [get_bd_intf_pins RocketChip/DMA_AXI4]
@@ -403,6 +427,10 @@ proc create_root_design { parentCell } {
       [get_bd_pins CIPS/s_axi_lpd_aclk] [get_bd_pins UART_Reset/slowest_sync_clk]
   connect_bd_net [get_bd_pins RocketChip/aresetn] [get_bd_pins Memory_Address/resetn] \
       [get_bd_pins IO/axi_reset] [get_bd_pins UART_Reset/ext_reset_in]
+  if {$pipeline_memory} {
+    connect_bd_net [get_bd_pins clk_wiz_0/clk_out1] [get_bd_pins Memory_Pipeline/aclk]
+    connect_bd_net [get_bd_pins RocketChip/aresetn] [get_bd_pins Memory_Pipeline/aresetn]
+  }
   connect_bd_net [get_bd_pins UART_Reset/peripheral_aresetn] [get_bd_pins IO/uart_resetn]
   connect_bd_net [get_bd_pins IO/uart_interrupt] [get_bd_pins IRQ/In0]
   connect_bd_net [get_bd_pins IO/ethernet_interrupt] [get_bd_pins IRQ/In2]
