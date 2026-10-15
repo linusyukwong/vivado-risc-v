@@ -1,25 +1,10 @@
-# Copyright (c) 2024 - 2025 Advanced Micro Devices, Inc. All rights reserved.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a
-# copy of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom the
-# Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-# DEALINGS IN THE SOFTWARE.
 
 ################################################################
-# Block design: riscv
+# This is a generated script based on design: riscv
+#
+# Though there are limitations about the generated script,
+# the main purpose of this utility is to make learning
+# IP Integrator Tcl commands easier.
 ################################################################
 
 namespace eval _tcl {
@@ -33,9 +18,23 @@ variable script_folder
 set script_folder [_tcl::get_script_folder]
 
 ################################################################
+# Check if script is running in correct Vivado version.
+################################################################
+set scripts_vivado_version 2025.1
+set current_vivado_version [version -short]
+
+if { [string first $scripts_vivado_version $current_vivado_version] == -1 } {
+   puts ""
+   catch {common::send_gid_msg -ssname BD::TCL -id 2041 -severity "ERROR" "This script was generated using Vivado <$scripts_vivado_version> and is being run in <$current_vivado_version> of Vivado. Please run the script in Vivado <$scripts_vivado_version> then open the design in Vivado <$current_vivado_version>. Upgrade the design by running \"Tools => Report => Report IP Status...\", then run write_bd_tcl to create an updated script."}
+
+   return 1
+}
+
+################################################################
 # START
 ################################################################
 
+# CHANGE DESIGN NAME HERE
 variable design_name
 set design_name riscv
 create_bd_design $design_name
@@ -315,13 +314,17 @@ proc create_root_design { parentCell } {
 
   # Create instance: RocketChip
   create_rocketchip_instance
+  set rocket_bscan [get_bd_intf_pins -quiet RocketChip/S_BSCAN]
+  if {[llength $rocket_bscan] != 1} {
+    error "V80 requires RocketChip/S_BSCAN. Regenerate rocket.vhdl with VHDL_OPTIONS=-e using make BOARD=v80."
+  }
 
   # Create instance: zero, and set properties
-  set zero [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 zero ]
+  set zero [ create_bd_cell -type inline_hdl -vlnv xilinx.com:inline_hdl:ilconstant:1.0 zero ]
   set_property CONFIG.CONST_VAL 0 $zero
 
   # Create instance: reset_inv, and set properties
-  set reset_inv [ create_bd_cell -type ip -vlnv xilinx.com:ip:util_vector_logic:2.0 reset_inv ]
+  set reset_inv [ create_bd_cell -type inline_hdl -vlnv xilinx.com:inline_hdl:ilvector_logic:1.0 reset_inv ]
   set_property -dict [list CONFIG.C_OPERATION not CONFIG.C_SIZE 1] $reset_inv
 
   # Create instance: Memory_Address, and set properties
@@ -372,13 +375,16 @@ proc create_root_design { parentCell } {
   set_property CONFIG.C_AUX_RESET_HIGH 1 $UART_Reset
 
   # Create instance: IRQ, and set properties
-  set IRQ [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconcat:2.1 IRQ ]
+  set IRQ [ create_bd_cell -type inline_hdl -vlnv xilinx.com:inline_hdl:ilconcat:1.0 IRQ ]
   set_property CONFIG.NUM_PORTS 8 $IRQ
 
   # Create interface connections
   # Native PMC BSCAN connects directly to the RISC-V Debug Module.
-  set cips_bscan [get_bd_intf_pins -of_objects $CIPS -filter {VLNV =~ *:bscan_rtl:*}]
-  connect_bd_intf_net $cips_bscan [get_bd_intf_pins RocketChip/S_BSCAN]
+  set cips_bscan [get_bd_intf_pins -quiet -of_objects $CIPS -filter {VLNV =~ *:bscan_rtl:*}]
+  if {[llength $cips_bscan] != 1} {
+    error "V80 requires exactly one native CIPS BSCAN interface; check PS_USE_BSCAN_USER1."
+  }
+  connect_bd_intf_net $cips_bscan $rocket_bscan
   connect_bd_intf_net [get_bd_intf_ports sys_clk0_1] [get_bd_intf_pins DDR/sys_clk0]
   connect_bd_intf_net [get_bd_intf_ports CH0_DDR4_0_1] [get_bd_intf_pins DDR/CH0_DDR4_0]
   connect_bd_intf_net $mem_intf [get_bd_intf_pins Memory_Address/S_AXI]
